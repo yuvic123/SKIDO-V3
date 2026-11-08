@@ -1,0 +1,804 @@
+-- Original script from discord.gg/syncrypt
+-- Deobfuscated / renamed for readability
+-- Fixed: grenade attempt limit raised, money drop range increased, rescan before hopping
+
+local unpack_ = unpack or table.unpack
+local GuiService = game:GetService("GuiService")
+local TeleportService = game:GetService("TeleportService")
+local Players = game:GetService("Players")
+local HttpService = game:GetService("HttpService")
+local RunService = game:GetService("RunService")
+local LocalPlayer = Players.LocalPlayer or Players:GetPropertyChangedSignal("LocalPlayer"):Wait()
+
+-- Returns the player's current money from leaderstats or DataFolder
+local function GetPlayerMoney()
+	local leaderstats = LocalPlayer:FindFirstChild("leaderstats")
+	if leaderstats then
+		leaderstats = leaderstats:FindFirstChild("Money")
+	end
+	if leaderstats then
+		return leaderstats.Value
+	end
+
+	local DataFolder = LocalPlayer:FindFirstChild("DataFolder")
+	if not DataFolder then
+		return 0
+	end
+	DataFolder = DataFolder:FindFirstChild("Currency")
+	return not DataFolder and 0 or DataFolder.Value
+end
+
+-- File path for persisting visited server IDs
+local visitedServersFile = "vault_visited_servers_" .. game.PlaceId .. "_" .. LocalPlayer.UserId .. ".json"
+local genv = getgenv()
+
+genv.VaultVisitedServers = genv.VaultVisitedServers or {}
+
+local PlaceId = game.PlaceId
+local placeUserKey = tostring(PlaceId) .. "_" .. tostring(LocalPlayer.UserId)
+local visitedServers = genv.VaultVisitedServers[placeUserKey] or {}
+
+genv.VaultVisitedServers[placeUserKey] = visitedServers
+
+-- Load previously visited server IDs from file
+if type(readfile) == "function" then
+	local ok, result = pcall(function()
+		return HttpService:JSONDecode(unpack_({ readfile(visitedServersFile) }))
+	end)
+	if ok then
+		ok = type(result) == "table"
+	end
+	if ok then
+		for k, v in pairs(result) do
+			if type(k) == "string" and v == true then
+				visitedServers[k] = true
+			end
+		end
+	end
+end
+
+-- Filters a server list page to eligible servers (not visited, not full, within player count range)
+local function FilterEligibleServers(serverPage, minPlayers, maxPlayers)
+	local eligible = {}
+	for _, server in ipairs(serverPage.data) do
+		local valid = type(server) == "table"
+		if valid then valid = type(server.id) == "string" end
+		if valid then valid = type(server.playing) == "number" end
+		if valid then valid = type(server.maxPlayers) == "number" end
+		if valid then valid = server.id ~= game.JobId end
+		if valid then valid = not visitedServers[server.id] end
+		if valid then valid = server.playing < server.maxPlayers end
+		if valid then valid = server.playing >= minPlayers and server.playing <= maxPlayers end
+
+		if valid then
+			table.insert(eligible, server.id)
+		end
+	end
+	return eligible
+end
+
+-- Mark current server as visited and save to file
+(function()
+	if game.JobId == "" then return end
+	visitedServers[game.JobId] = true
+
+	if type(writefile) == "function" then
+		local ok, err = pcall(function()
+			writefile(visitedServersFile, HttpService:JSONEncode(visitedServers))
+		end)
+		if not ok then
+			warn("Could not save visited server IDs: " .. tostring(err))
+		end
+	else
+		warn("File saving unavailable; visited IDs cannot persist across server joins.")
+	end
+end)()
+
+-- Fetches a page of public servers from the Roblox API
+local function FetchServerPage(sortOrder, cursor)
+	local url = "https://games.roblox.com/v1/games/" .. game.PlaceId .. "/servers/Public?sortOrder=" .. sortOrder .. "&limit=100"
+	if cursor then
+		url = url .. "&cursor=" .. HttpService:UrlEncode(cursor)
+	end
+
+	local ok, result = pcall(function()
+		return HttpService:JSONDecode(unpack_({ game:HttpGet(url) }))
+	end)
+
+	if not ok then return nil end
+	if type(result) ~= "table" then return nil end
+	if type(result.data) ~= "table" then return nil end
+	return result
+end
+
+local FindEligibleServer -- forward declaration
+
+local isHopping = false
+
+-- Initiates a server hop, trying to find and teleport to an eligible server
+local function DoServerHop()
+	local executor = (identifyexecutor or function() return "Unknown" end)()
+	local useSolara = executor:match("Solara") or (executor:match("Xeno") or not queue_on_teleport)
+	local targetServerId = FindEligibleServer(useSolara and "Asc" or "Desc")
+
+	if not targetServerId then
+		warn("No unvisited eligible server found (fallback: 3-6 players); retrying in 10 seconds.")
+		return
+	end
+
+	if useSolara then
+		TeleportService:TeleportToPlaceInstance(game.PlaceId, targetServerId, LocalPlayer)
+		return
+	end
+
+	queue_on_teleport(" if not game:IsLoaded() then game.Loaded:Wait() end ")
+	TeleportService:TeleportToPlaceInstance(game.PlaceId, targetServerId, LocalPlayer)
+end
+
+-- Finds an eligible server ID, paginating through server list as needed
+FindEligibleServer = function(sortOrder)
+	local firstPage = FetchServerPage(sortOrder)
+	local nextCursor, seen = nil, {}
+
+	if firstPage then
+		local candidates = FilterEligibleServers(firstPage, 2, 35)
+		if #candidates > 0 then
+			return candidates[math.random(1, #candidates)]
+		end
+	else
+		return nil
+	end
+
+	-- Fallback: paginate ascending looking for 3-6 player servers
+	while true do
+		local page = FetchServerPage("Asc", nextCursor)
+		if not page then break end
+
+		local candidates = FilterEligibleServers(page, 3, 6)
+		if #candidates > 0 then
+			return candidates[math.random(1, #candidates)]
+		end
+
+		-- Stop if the last server already exceeds the max player count
+		local lastServer = page.data[#page.data]
+		if lastServer and type(lastServer.playing) == "number" and lastServer.playing > 6 then
+			return nil
+		end
+
+		nextCursor = page.nextPageCursor
+		if type(nextCursor) ~= "string" or nextCursor == "" or seen[nextCursor] then
+			return nil
+		end
+
+		seen[nextCursor] = true
+		task.wait(0.25)
+	end
+
+	return nil
+end
+
+-- Starts the server hop loop (only runs once)
+local function StartHopLoop()
+	if isHopping then return end
+	isHopping = true
+	task.wait(1)
+	while true do
+		local ok, err = pcall(DoServerHop)
+		if not ok then
+			warn("Server hop failed: " .. tostring(err))
+		end
+		task.wait(10)
+	end
+end
+
+-- Trigger hop loop on GUI error message
+GuiService.ErrorMessageChanged:Connect(function()
+	StartHopLoop()
+end)
+
+-- Also trigger on ErrorPrompt appearing in CoreGui
+task.spawn(function()
+	local promptOverlay = game:GetService("CoreGui"):WaitForChild("RobloxPromptGui", 15)
+	if promptOverlay then
+		promptOverlay = promptOverlay:WaitForChild("promptOverlay", 10)
+	end
+	if not promptOverlay then return end
+
+	if promptOverlay:FindFirstChild("ErrorPrompt") then
+		StartHopLoop()
+	end
+
+	promptOverlay.ChildAdded:Connect(function(child)
+		if child.Name == "ErrorPrompt" then
+			StartHopLoop()
+		end
+	end)
+end)
+
+-- Wait for game and character to fully load
+if not game:IsLoaded() then
+	game.Loaded:Wait()
+end
+
+(LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()):WaitForChild("FULLY_LOADED_CHAR")
+
+local CurrentCamera = workspace.CurrentCamera
+local fireclickdetector_ = fireclickdetector
+
+-- Loads and executes a remote Lua script by URL
+local function LoadAndRunScript(url)
+	local ok, result = pcall(game.HttpGet, game, url)
+	if ok and result then
+		local chunk, err = loadstring(result)
+		if chunk then
+			chunk()
+		else
+			warn("Loadstring compile error: ", err)
+		end
+	else
+		warn("HTTP Fetch failed for: ", url)
+	end
+end
+
+-- Load external scripts
+LoadAndRunScript("https://raw.githubusercontent.com/yuvic123/Unthinkable-Present/refs/heads/main/UP")
+LoadAndRunScript("https://raw.githubusercontent.com/YuvicHaha/batoon/refs/heads/main/bat")
+
+-- Position in front of the vault area
+local vaultStandPosition = Vector3.new(-616.1, -31.08, -267.78)
+
+-- Body part names for KO cleanup
+local bodyParts = {
+	"Head", "RightHand", "LeftHand", "LowerTorso", "UpperTorso",
+	"LeftLowerLeg", "RightLowerLeg", "RightFoot", "LeftFoot",
+	"LeftUpperLeg", "RightUpperLeg", "RightUpperArm", "RightLowerArm",
+	"LeftLowerArm", "LeftUpperArm"
+}
+
+-- Remove body parts when player is KO'd (to avoid ragdoll issues)
+RunService.Heartbeat:Connect(function()
+	local Character = LocalPlayer.Character
+	if not Character then return end
+
+	local Humanoid = Character:FindFirstChildOfClass("Humanoid")
+	local koValue = Character:FindFirstChild("BodyEffects")
+	if koValue then
+		koValue = koValue:FindFirstChild("K.O")
+	end
+
+	local isKOd = false
+	if Humanoid and Humanoid.Health <= 5 then
+		isKOd = true
+	elseif koValue and koValue.Value == true then
+		isKOd = true
+	end
+
+	if not isKOd then return end
+
+	for _, partName in ipairs(bodyParts) do
+		local part = Character:FindFirstChild(partName)
+		if part then part:Destroy() end
+	end
+end)
+
+-- Resolve HTTP request function across different executors
+local request_ = request
+if not request_ then
+	request_ = http_request
+	if not request_ then
+		if syn and syn.request then
+			request_ = syn.request
+		elseif fluxus and fluxus.request then
+			request_ = fluxus.request
+		end
+	end
+end
+
+-- Returns true if any vault NPC (name matches "VAULT") is alive
+local function IsVaultAlive()
+	local Cashiers = workspace:FindFirstChild("Cashiers")
+	if not Cashiers then return false end
+
+	for _, npc in ipairs(Cashiers:GetChildren()) do
+		if npc.Name:match("VAULT") then
+			local hum = npc:FindFirstChild("Humanoid")
+			if hum and hum.Health > 0 then
+				return true
+			end
+		end
+	end
+	return false
+end
+
+-- Simple hop loop without the isHopping guard (used mid-run)
+local function HopImmediately()
+	if isHopping then return end
+	while true do
+		local ok, err = pcall(DoServerHop)
+		if not ok then
+			warn("Server hop failed: " .. tostring(err))
+		end
+		task.wait(10)
+	end
+end
+
+-- Returns nearby MoneyDrop parts within range of the player
+-- FIX: increased range from 45 to 90 studs so farther drops aren't missed
+local function GetNearbyMoneyDrops()
+	local drops = {}
+	local dropFolder = workspace:FindFirstChild("Ignored")
+	if dropFolder then
+		dropFolder = dropFolder:FindFirstChild("Drop")
+	end
+	if not dropFolder then return drops end
+
+	local hrp = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+
+	for _, child in ipairs(dropFolder:GetChildren()) do
+		if child.Name == "MoneyDrop" and hrp and child:IsA("BasePart") then
+			if (child.Position - hrp.Position).Magnitude <= 90 then -- FIX: was 45
+				table.insert(drops, child)
+			end
+		end
+	end
+	return drops
+end
+
+-- Cache for player headshot thumbnail URL
+local cachedAvatarUrl = nil
+
+-- Returns the player's headshot thumbnail URL
+local function GetAvatarUrl()
+	if cachedAvatarUrl then return cachedAvatarUrl end
+
+	local ok, result = pcall(function()
+		local url = "https://thumbnails.roblox.com/v1/users/avatar-headshot?userIds=" .. LocalPlayer.UserId .. "&size=150x150&format=Png&isCircular=false"
+		local data = HttpService:JSONDecode(game:HttpGet(url))
+		if data.data and data.data[1] then
+			return data.data[1].imageUrl
+		end
+	end)
+
+	if ok and type(result) == "string" and result:match("^https://") then
+		cachedAvatarUrl = result
+	else
+		cachedAvatarUrl = "https://www.roblox.com/headshot-thumbnail/image?userId=" .. LocalPlayer.UserId .. "&width=150&height=150&format=png"
+	end
+
+	return cachedAvatarUrl
+end
+
+-- Sends a webhook notification with earnings info
+local function SendWebhook(reason, earned)
+	local webhook = getgenv().webhook
+	if not webhook or webhook == "" or not request_ then return end
+
+	local totalMoney = GetPlayerMoney()
+	local fields = {
+		{ name = "Total Money", value = "**$" .. tostring(totalMoney) .. "**", inline = true },
+		{ name = "Earned This Server", value = "**$" .. tostring(earned) .. "**", inline = true }
+	}
+
+	if reason and reason:find("Instant Skip:", 1, true) then
+		table.insert(fields, {
+			name = "Server Hop",
+			value = "No vaults — server hopping.",
+			inline = false
+		})
+	end
+
+	local payload = {
+		embeds = {
+			{
+				thumbnail = { url = GetAvatarUrl() },
+				fields = fields
+			}
+		}
+	}
+
+	pcall(function()
+		request_({
+			Url = webhook,
+			Method = "POST",
+			Headers = { ["Content-Type"] = "application/json" },
+			Body = HttpService:JSONEncode(payload)
+		})
+	end)
+end
+
+-- Buys a grenade from the shop by teleporting to the shop NPC and clicking
+local function BuyGrenade()
+	local Shop = workspace:FindFirstChild("Ignored")
+	if Shop then Shop = Shop:FindFirstChild("Shop") end
+	local grenadeShop = Shop and Shop:FindFirstChild("[Grenade] - $788")
+	local clickDetector = grenadeShop and grenadeShop:FindFirstChild("ClickDetector")
+	local hrp = clickDetector and LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+	if not hrp then return end
+
+	local originalCFrame = hrp.CFrame
+	hrp.CFrame = grenadeShop.Head.CFrame * CFrame.new(0, 3, 0)
+	task.wait(0.5)
+	fireclickdetector_(grenadeShop.ClickDetector, 0)
+	task.wait(0.3)
+	hrp.CFrame = originalCFrame
+end
+
+-- Main vault run logic
+local function RunVault()
+	-- Wait for character
+	while not (LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")) do
+		task.wait()
+	end
+
+	-- Skip if no vaults are alive on join
+	if not IsVaultAlive() then
+		SendWebhook("Instant Skip: All 4 vaults are empty on join.", 0)
+		HopImmediately()
+		return
+	end
+
+	local Character = LocalPlayer.Character
+	local HumanoidRootPart = Character:WaitForChild("HumanoidRootPart")
+	local Humanoid = Character:WaitForChild("Humanoid")
+	local moneyAtStart = GetPlayerMoney()
+
+	-- Move to vault area
+	HumanoidRootPart.CFrame = CFrame.new(vaultStandPosition)
+	task.wait(1.2)
+
+	-- Check if the outer vault door (VaultPart) exists
+	local function GetVaultPart()
+		local m = workspace:FindFirstChild("MAP")
+		if m then m = m:FindFirstChild("Map") end
+		if m then m = m:FindFirstChild("Vault") end
+		if m then m = m:FindFirstChild("VaultPart") end
+		return m
+	end
+
+	local vaultPart = GetVaultPart()
+	local vaultIsOpen = not vaultPart -- if VaultPart is gone, vault is already open
+
+	-- Shop items to purchase
+	local shopItems = {
+		{ Name = "[Grenade] - $788",             Count = vaultIsOpen and 0 or 3 },
+		{ Name = "[Drum-Shotgun] - $1238",        Count = 1 },
+		{ Name = "18 [Drum-Shotgun Ammo] - $73",  Count = 4 }
+	}
+
+	-- Buy items from the shop
+	local Shop = workspace:FindFirstChild("Ignored")
+	if Shop then Shop = Shop:FindFirstChild("Shop") end
+	if Shop then
+		for _, item in ipairs(shopItems) do
+			if item.Count > 0 then
+				local npc = Shop:FindFirstChild(item.Name)
+				if npc then
+					HumanoidRootPart.CFrame = npc.Head.CFrame * CFrame.new(0, 3, 0)
+					task.wait(0.5)
+					for _ = 1, item.Count do
+						fireclickdetector_(npc.ClickDetector, 0)
+						task.wait(0.25)
+					end
+				end
+			end
+		end
+	end
+
+	-- Locks camera to look at a target part; returns restore and update functions
+	local function LockCameraAt(targetPart)
+		local savedCameraMode = LocalPlayer.CameraMode
+		local savedMinZoom = LocalPlayer.CameraMinZoomDistance
+		local savedMaxZoom = LocalPlayer.CameraMaxZoomDistance
+		local savedCameraType = CurrentCamera.CameraType
+		local savedSubject = CurrentCamera.CameraSubject
+		local targetPos = targetPart.Position
+		local bindKey = "VaultGrenadeCamlock_" .. LocalPlayer.UserId
+		local restored = false
+
+		local function RestoreCamera()
+			if restored then return end
+			restored = true
+			LocalPlayer.CameraMaxZoomDistance = savedMaxZoom
+			LocalPlayer.CameraMinZoomDistance = savedMinZoom
+			LocalPlayer.CameraMode = savedCameraMode
+			CurrentCamera.CameraType = savedCameraType
+			CurrentCamera.CameraSubject = savedSubject or Humanoid
+		end
+
+		local function UpdateCamera()
+			if restored then return end
+			if LocalPlayer.Character ~= Character or not HumanoidRootPart.Parent or Humanoid.Health <= 0 then
+				RestoreCamera()
+				return
+			end
+
+			if targetPart.Parent then
+				targetPos = targetPart.Position
+			end
+
+			LocalPlayer.CameraMinZoomDistance = 0.5
+			LocalPlayer.CameraMaxZoomDistance = 0.5
+			LocalPlayer.CameraMode = Enum.CameraMode.LockFirstPerson
+			CurrentCamera.CameraType = Enum.CameraType.Custom
+			CurrentCamera.CameraSubject = Humanoid
+
+			local camPos = CurrentCamera.CFrame.Position
+			if (targetPos - camPos).Magnitude > 0.01 then
+				CurrentCamera.CFrame = CFrame.new(camPos, targetPos)
+				CurrentCamera.Focus = CFrame.new(targetPos)
+			end
+		end
+
+		UpdateCamera()
+		if restored then return RestoreCamera, UpdateCamera end
+		RunService:BindToRenderStep(bindKey, Enum.RenderPriority.Camera.Value + 1, UpdateCamera)
+		return RestoreCamera, UpdateCamera
+	end
+
+	-- Simulate a tap/click at screen center (mobile support)
+	local function TapScreenCenter()
+		local UIS = game:GetService("UserInputService")
+		if not UIS.TouchEnabled or UIS.KeyboardEnabled or UIS.MouseEnabled then return end
+
+		local ok, err = pcall(function()
+			local VIM = game:GetService("VirtualInputManager")
+			local center = CurrentCamera.ViewportSize / 2
+			VIM:SendMouseMoveEvent(center.X, center.Y, game)
+			for _ = 1, 2 do
+				VIM:SendMouseButtonEvent(center.X, center.Y, 0, true, game, 0)
+				VIM:SendMouseButtonEvent(center.X, center.Y, 0, false, game, 0)
+			end
+		end)
+
+		if not ok then
+			warn("Center-screen M1 unavailable; tap the vault manually. " .. tostring(err))
+		end
+	end
+
+	-- Throws grenades to blow open the outer vault; returns true if vault opened, false on failure
+	-- FIX: attempt limit raised from 4 to 8, added extra settle time after each explosion
+	local function BlastOpenOuterVault()
+		local attempts = 0
+		while true do
+			local currentVaultPart = GetVaultPart()
+
+			-- Vault is open
+			if not (currentVaultPart and currentVaultPart.Parent) then
+				return true
+			end
+			if Humanoid.Health <= 0 or LocalPlayer.Character ~= Character then
+				return false
+			end
+			if attempts >= 8 then -- FIX: was 4
+				warn("Outer vault is still closed after 8 grenade attempts; server hopping.")
+				HopImmediately()
+				return false
+			end
+
+			attempts = attempts + 1
+
+			-- Get or buy a grenade
+			local grenade = LocalPlayer.Backpack:FindFirstChild("[Grenade]") or Character:FindFirstChild("[Grenade]")
+			if not grenade then
+				BuyGrenade()
+				task.wait(0.4)
+				grenade = LocalPlayer.Backpack:FindFirstChild("[Grenade]") or Character:FindFirstChild("[Grenade]")
+			end
+			if not grenade then
+				warn("No grenade available to reopen the outer vault; stopping this run.")
+				return false
+			end
+
+			-- Move and throw
+			HumanoidRootPart.CFrame = CFrame.new(vaultStandPosition)
+			task.wait(0.6)
+
+			local aimPos = currentVaultPart.Position - Vector3.new(0, 10, 0)
+			HumanoidRootPart.CFrame = CFrame.new(HumanoidRootPart.Position, Vector3.new(aimPos.X, HumanoidRootPart.Position.Y, aimPos.Z))
+
+			local restoreCam, updateCam = LockCameraAt(currentVaultPart)
+			TapScreenCenter()
+			Humanoid:EquipTool(grenade)
+			task.wait(0.5)
+			updateCam()
+			grenade:Activate()
+			task.wait(0.7)
+			if grenade.Parent == Character then
+				updateCam()
+				grenade:Activate()
+			end
+			task.wait(2.2)
+			restoreCam()
+			Humanoid:UnequipTools()
+			task.wait(2)
+			task.wait(1) -- FIX: extra settle time so VaultPart destruction can register
+		end
+	end
+
+	-- Blast open the inner vault door if it's closed
+	if not vaultIsOpen and vaultPart then
+		local attempts = 0
+		while true do
+			local stillExists = vaultPart and vaultPart.Parent and attempts < 8 -- FIX: was 4
+			if not stillExists then
+				if attempts >= 8 then
+					warn("Initial vault door still closed after 8 attempts; server hopping.")
+					HopImmediately()
+				end
+				break
+			end
+			if Humanoid.Health <= 0 then return end
+
+			attempts = attempts + 1
+
+			local grenade = LocalPlayer.Backpack:FindFirstChild("[Grenade]") or Character:FindFirstChild("[Grenade]")
+			if not grenade then
+				BuyGrenade()
+				task.wait(0.4)
+				grenade = LocalPlayer.Backpack:FindFirstChild("[Grenade]") or Character:FindFirstChild("[Grenade]")
+			end
+
+			if grenade then
+				HumanoidRootPart.CFrame = CFrame.new(vaultStandPosition)
+				task.wait(0.6)
+
+				local aimPos = vaultPart.Position - Vector3.new(0, 10, 0)
+				HumanoidRootPart.CFrame = CFrame.new(HumanoidRootPart.Position, Vector3.new(aimPos.X, HumanoidRootPart.Position.Y, aimPos.Z))
+
+				local restoreCam, updateCam = LockCameraAt(vaultPart)
+				TapScreenCenter()
+				Humanoid:EquipTool(grenade)
+				task.wait(0.5)
+				updateCam()
+				grenade:Activate()
+				task.wait(0.7)
+				if grenade.Parent == Character then
+					updateCam()
+					grenade:Activate()
+				end
+				task.wait(2.2)
+				restoreCam()
+				Humanoid:UnequipTools()
+			end
+
+			task.wait(2)
+			task.wait(1) -- FIX: extra settle time
+		end
+
+		CurrentCamera.CameraType = Enum.CameraType.Custom
+		CurrentCamera.CameraSubject = Humanoid
+	end
+
+	-- Kill each vault NPC using the Drum-Shotgun
+	local Cashiers = workspace:FindFirstChild("Cashiers")
+	if Cashiers then
+		for _, npc in ipairs(Cashiers:GetChildren()) do
+			-- Ensure outer vault is open before engaging each NPC
+			if not BlastOpenOuterVault() then return end
+
+			local npcHumanoid = npc:FindFirstChildOfClass("Humanoid")
+			local npcHead = npc:FindFirstChild("Head") or npc:FindFirstChild("Part")
+			local isVaultNPC = npc.Name:match("VAULT") and npcHumanoid and npcHumanoid.Health > 0 and npcHead
+
+			if isVaultNPC then
+				local shotgun = LocalPlayer.Backpack:FindFirstChild("[Drum-Shotgun]") or Character:FindFirstChild("[Drum-Shotgun]")
+				if shotgun then
+					Humanoid:EquipTool(shotgun)
+					task.wait(0.4)
+					LocalPlayer.CameraMode = Enum.CameraMode.LockFirstPerson
+
+					local standCFrame = npcHead.CFrame * CFrame.new(0, 0, 3.5)
+					HumanoidRootPart.CFrame = standCFrame
+					task.wait(0.2)
+
+					-- Keep shooting until NPC is dead
+					while npcHumanoid.Health > 0 and npc.Parent do
+						if Humanoid.Health <= 0 then
+							LocalPlayer.CameraMode = Enum.CameraMode.Classic
+							return
+						end
+
+						-- Re-blast vault if it closes mid-fight
+						local innerVaultPart = GetVaultPart()
+						if innerVaultPart and innerVaultPart.Parent then
+							Humanoid:UnequipTools()
+							if not BlastOpenOuterVault() then
+								LocalPlayer.CameraMode = Enum.CameraMode.Classic
+								return
+							end
+							if not npc.Parent or npcHumanoid.Health <= 0 then break end
+							Humanoid:EquipTool(shotgun)
+							task.wait(0.4)
+							LocalPlayer.CameraMode = Enum.CameraMode.LockFirstPerson
+							HumanoidRootPart.CFrame = standCFrame
+							task.wait(0.2)
+						end
+
+						-- Face the NPC
+						HumanoidRootPart.CFrame = CFrame.new(HumanoidRootPart.Position, Vector3.new(npcHead.Position.X, npcHead.Position.Y, npcHead.Position.Z))
+
+						-- Reload if low on ammo
+						local ammoValue = shotgun:FindFirstChild("Ammo")
+						if ammoValue and ammoValue.Value <= 1 then
+							local MainEvent = game:GetService("ReplicatedStorage"):FindFirstChild("MainEvent")
+							if MainEvent then
+								MainEvent:FireServer("Reload", shotgun)
+							end
+							task.wait(2)
+							HumanoidRootPart.CFrame = standCFrame
+						end
+
+						shotgun:Activate()
+						task.wait(0.12)
+					end
+
+					Humanoid:UnequipTools()
+					LocalPlayer.CameraMode = Enum.CameraMode.Classic
+					task.wait(0.2)
+				end
+			end
+		end
+	end
+
+	-- Collect money drops
+	Humanoid:UnequipTools()
+	task.wait(0.5)
+
+	local lockToCFrame = nil
+	local lockConnection = RunService.PreSimulation:Connect(function()
+		if lockToCFrame and HumanoidRootPart.Parent and LocalPlayer.Character == Character and Humanoid.Health > 0 then
+			HumanoidRootPart.CFrame = lockToCFrame
+		end
+	end)
+
+	local startTime = tick()
+	while tick() - startTime < 25 do
+		local drops = GetNearbyMoneyDrops()
+
+		-- FIX: don't hop on first empty scan — wait and rescan once to avoid
+		-- hopping early when drops spawn slightly outside the previous 45 stud range
+		if #drops == 0 then
+			task.wait(1.5)
+			drops = GetNearbyMoneyDrops()
+			if #drops == 0 then
+				lockConnection:Disconnect()
+				local earned = math.max(0, GetPlayerMoney() - moneyAtStart)
+				SendWebhook("Successfully finished run and harvested money.", earned)
+				task.wait(1)
+				HopImmediately()
+				return
+			end
+		end
+
+		for _, drop in ipairs(drops) do
+			local cd = drop:FindFirstChildOfClass("ClickDetector")
+			if cd and HumanoidRootPart then
+				lockToCFrame = drop.CFrame * CFrame.new(0, 3, 0)
+				HumanoidRootPart.CFrame = lockToCFrame
+				task.wait(0.4)
+				fireclickdetector_(cd)
+				task.wait(0.4)
+			end
+		end
+
+		task.wait(0.5)
+	end
+
+	lockConnection:Disconnect()
+	local earned = math.max(0, GetPlayerMoney() - moneyAtStart)
+	SendWebhook("Successfully finished run and harvested money.", earned)
+	task.wait(1)
+	HopImmediately()
+end
+
+-- Entry point
+if IsVaultAlive() then
+	LocalPlayer.CharacterAdded:Connect(function()
+		task.wait(1.5)
+		RunVault()
+	end)
+	RunVault()
+else
+	SendWebhook("Instant Skip: Server empty at execution.", 0)
+	HopImmediately()
+end
